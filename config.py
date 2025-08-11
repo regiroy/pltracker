@@ -6,37 +6,44 @@ load_dotenv()
 
 class QuickBooksConfig:
     """Configuration class for QuickBooks API settings"""
-    
+
     # QuickBooks API credentials
-    CLIENT_ID = os.getenv('QUICKBOOKS_CLIENT_ID')
-    CLIENT_SECRET = os.getenv('QUICKBOOKS_CLIENT_SECRET')
-    REDIRECT_URI = os.getenv('QUICKBOOKS_REDIRECT_URI', 'http://localhost:8080/callback')
-    
-    # Environment detection
-    ENVIRONMENT = os.getenv('QUICKBOOKS_ENVIRONMENT', 'sandbox')  # 'sandbox' or 'production'
-    
-    # QuickBooks API endpoints
-    BASE_URL = "https://sandbox.qbo.intuit.com/"  # Same for both sandbox and production
+    CLIENT_ID = os.getenv("QUICKBOOKS_CLIENT_ID")
+    CLIENT_SECRET = os.getenv("QUICKBOOKS_CLIENT_SECRET")
+    REDIRECT_URI = os.getenv("QUICKBOOKS_REDIRECT_URI", "http://localhost:8080/callback")
+
+    # Environment
+    ENVIRONMENT = os.getenv("QUICKBOOKS_ENVIRONMENT", "sandbox")  # 'sandbox' or 'production'
+
+    # Data API base (for your resource calls, not OAuth)
+    # Sandbox and prod have different API hosts
     if ENVIRONMENT == "sandbox":
-        API_BASE_URL = "https://sandbox.qbo.intuit.com/"
+        API_BASE_URL = "https://sandbox-quickbooks.api.intuit.com"
     else:
         API_BASE_URL = "https://quickbooks.api.intuit.com"
-    
-    # OAuth endpoint paths
-    OAUTH_AUTHORIZE_PATH = '/connect/oauth2'  # OAuth endpoint
-    OAUTH_TOKEN_PATH = '/connect/oauth2/token'  # Token endpoint
-    
-    # Scopes needed for reading projects and expenses
+
+    # ----- OAuth endpoints (correct hosts) -----
+    # UI for user consent:
+    OAUTH_AUTH_HOST = "https://appcenter.intuit.com"
+    OAUTH_AUTHORIZE_PATH = "/connect/oauth2"
+    # Token endpoint:
+    OAUTH_TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+
+    # Scopes (space-delimited at request time)
+    # Ensure your Intuit app actually has access to these
     SCOPES = [
-        'com.intuit.quickbooks.accounting',
-        'com.intuit.quickbooks.payment',
-        'com.intuit.quickbooks.payroll'
+        "com.intuit.quickbooks.accounting",
+        # include these only if your app is entitled to them:
+        # "com.intuit.quickbooks.payment",
+        # "com.intuit.quickbooks.payroll",
+        # Optional OIDC scopes if you want user info:
+        # "openid", "profile", "email"
     ]
-    
-    # Data export settings
-    EXPORT_FORMATS = ['csv', 'excel', 'json']
-    DEFAULT_EXPORT_FORMAT = 'excel'
-    
+
+    # Data export
+    EXPORT_FORMATS = ["csv", "excel", "json"]
+    DEFAULT_EXPORT_FORMAT = "excel"
+
     # File paths
-    OUTPUT_DIR = 'exports'
-    TOKEN_FILE = 'quickbooks_token.json' 
+    OUTPUT_DIR = "exports"
+    TOKEN_FILE = ".secrets/quickbooks_token.json"  # put secrets in a folder

@@ -1,249 +1,337 @@
 #!/usr/bin/env python3
 """
 QuickBooks Authentication Helper
-Assists with OAuth setup and token management for QuickBooks API access.
+- Opens the Intuit consent screen
+- Captures ?code and ?realmId on your fixed redirect URI
+- Exchanges code for real tokens
+- Saves/loads tokens
+- Auto-refreshes tokens when expired
+- Simple smoke test against CompanyInfo
 """
 
 import os
 import json
-import webbrowser
+import base64
+import time
+import threading
 import http.server
 import socketserver
-import urllib.parse
-from urllib.parse import parse_qs, urlparse
+import webbrowser
+from typing import Optional
+from urllib.parse import urlencode, urlparse, parse_qs, quote
+
+import requests
 from config import QuickBooksConfig
 
+
 class QuickBooksAuthHelper:
-    """Helper class for QuickBooks OAuth authentication"""
-    
     def __init__(self):
         self.config = QuickBooksConfig()
-        self.auth_code = None
+        self.state = self._random_state()
+
+        # Parse the fixed redirect_uri from config (must match app exactly)
+        ru = urlparse(self.config.REDIRECT_URI)
+        if ru.scheme not in ("http", "https"):
+            raise RuntimeError("REDIRECT_URI must start with http:// or https://")
+        self._redirect_host = ru.hostname or "localhost"
+        self._redirect_port = ru.port or (443 if ru.scheme == "https" else 80)
+        self._redirect_path = ru.path or "/callback"
+
+        # runtime fields
         self.server = None
-        
-    def get_authorization_url(self) -> str:
-        """Generate the authorization URL for QuickBooks OAuth"""
-        if not self.config.CLIENT_ID:
-            raise Exception("QUICKBOOKS_CLIENT_ID not set in environment variables")
-        
+        self.auth_code: Optional[str] = None
+        self.realm_id: Optional[str] = None
+
+        # storage
+        self.token_file = getattr(self.config, "TOKEN_FILE", ".secrets/quickbooks_token.json")
+        os.makedirs(os.path.dirname(self.token_file), exist_ok=True)
+
+        # sanity checks
+        missing = []
+        if not getattr(self.config, "CLIENT_ID", None):
+            missing.append("QUICKBOOKS_CLIENT_ID")
+        if not getattr(self.config, "CLIENT_SECRET", None):
+            missing.append("QUICKBOOKS_CLIENT_SECRET")
+        if not getattr(self.config, "REDIRECT_URI", None):
+            missing.append("QUICKBOOKS_REDIRECT_URI")
+        if missing:
+            raise RuntimeError("Missing env/config: " + ", ".join(missing))
+
+    # ---------- OAuth URLs ----------
+
+    def _authorize_url(self) -> str:
+        scope_str = " ".join(getattr(self.config, "SCOPES", []))
         params = {
-            'client_id': self.config.CLIENT_ID,
-            'response_type': 'code',
-            'scope': ' '.join(self.config.SCOPES),
-            'redirect_uri': self.config.REDIRECT_URI,
-            'state': 'random_state_string'
+            "client_id": self.config.CLIENT_ID,
+            "response_type": "code",
+            "scope": scope_str,
+            "redirect_uri": self.config.REDIRECT_URI,
+            "state": self.state,
         }
-        
-        query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
-        return f"{self.config.BASE_URL}{self.config.OAUTH_AUTHORIZE_PATH}?{query_string}"
-    
-    def start_local_server(self):
-        """Start a local server to receive the authorization code"""
+        query = urlencode(params, quote_via=quote)
+        return f"{self.config.OAUTH_AUTH_HOST}{self.config.OAUTH_AUTHORIZE_PATH}?{query}"
+
+    # ---------- Local Callback Server ----------
+
+    def _start_local_server(self):
         class AuthHandler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                # Parse the authorization code from the callback
-                parsed_url = urlparse(self.path)
-                query_params = parse_qs(parsed_url.query)
-                
-                if 'code' in query_params:
-                    auth_code = query_params['code'][0]
-                    self.server.auth_code = auth_code
-                    
-                    # Send success response
-                    self.send_response(200)
-                    self.send_header('Content-type', 'text/html')
-                    self.end_headers()
-                    
-                    response = """
-                    <html>
-                    <body>
-                        <h2>Authentication Successful!</h2>
-                        <p>You can close this window and return to your terminal.</p>
-                        <script>window.close();</script>
-                    </body>
-                    </html>
-                    """
-                    self.wfile.write(response.encode())
-                    
-                    # Stop the server
+            def do_GET(self_inner):
+                parsed = urlparse(self_inner.path)
+                if parsed.path != self._redirect_path:
+                    self_inner.send_response(404)
+                    self_inner.end_headers()
+                    self_inner.wfile.write(b"Not Found")
+                    return
+
+                q = parse_qs(parsed.query)
+                code = q.get("code", [None])[0]
+                state = q.get("state", [None])[0]
+                realm_id = q.get("realmId", [None])[0]
+
+                if not code or state != self.state:
+                    self_inner.send_response(400)
+                    self_inner.end_headers()
+                    self_inner.wfile.write(b"Invalid authorization response.")
                     self.server.should_stop = True
-                else:
-                    # Send error response
-                    self.send_response(400)
-                    self.send_header('Content-type', 'text/html')
-                    self.end_headers()
-                    
-                    response = """
-                    <html>
-                    <body>
-                        <h2>Authentication Error</h2>
-                        <p>No authorization code received. Please try again.</p>
-                    </body>
-                    </html>
-                    """
-                    self.wfile.write(response.encode())
-            
-            def log_message(self, format, *args):
-                # Suppress server log messages
-                pass
-        
-        # Create server with custom attributes - try different ports if 8080 is busy
-        ports_to_try = [8080, 8081, 8082, 8083, 8084]
-        server = None
-        
-        for port in ports_to_try:
-            try:
-                server = socketserver.TCPServer(("localhost", port), AuthHandler)
-                server.auth_code = None
-                server.should_stop = False
-                print(f"Local server started on port {port}")
-                break
-            except OSError:
-                if port == ports_to_try[-1]:  # Last port tried
-                    raise Exception("Could not find an available port. Please close other applications using ports 8080-8084.")
-                continue
-        
-        if not server:
-            raise Exception("Failed to start local server")
-        
+                    return
+
+                self.server.auth_code = code
+                self.server.realm_id = realm_id
+
+                self_inner.send_response(200)
+                self_inner.send_header("Content-Type", "text/html")
+                self_inner.end_headers()
+                self_inner.wfile.write(b"""
+                    <html><body>
+                    <h2>Authentication Successful!</h2>
+                    <p>You can close this window and return to the terminal.</p>
+                    <script>window.close();</script>
+                    </body></html>
+                """)
+                self.server.should_stop = True
+
+            def log_message(self_inner, fmt, *args):
+                return
+
+        class ReusableTCPServer(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+
+        server = ReusableTCPServer((self._redirect_host, self._redirect_port), AuthHandler)
+        server.auth_code = None
+        server.realm_id = None
+        server.should_stop = False
         self.server = server
-        
-        print(f"Local server ready on port {server.server_address[1]}...")
-        
-        # Start server in a separate thread
-        import threading
-        server_thread = threading.Thread(target=self._run_server)
-        server_thread.daemon = True
-        server_thread.start()
-        
-        return server
-    
-    def _run_server(self):
-        """Run the server until stopped"""
+
+        t = threading.Thread(target=self._serve_until_stopped, daemon=True)
+        t.start()
+        print(f"Callback server listening on {self._redirect_host}:{self._redirect_port}{self._redirect_path}")
+
+    def _serve_until_stopped(self):
         while not self.server.should_stop:
             self.server.handle_request()
-    
-    def authenticate(self) -> dict:
-        """Complete the OAuth authentication flow"""
-        print("Starting QuickBooks OAuth authentication...")
-        
-        # Check if we have the required credentials
-        if not self.config.CLIENT_ID or not self.config.CLIENT_SECRET:
-            print("Error: Missing QuickBooks credentials.")
-            print("Please set the following environment variables:")
-            print("  QUICKBOOKS_CLIENT_ID")
-            print("  QUICKBOOKS_CLIENT_SECRET")
-            return None
-        
-        # Start local server first to get the actual port
-        server = self.start_local_server()
-        
-        # Update redirect URI to match the actual port used
-        actual_port = server.server_address[1]
-        self.config.REDIRECT_URI = f"http://localhost:{actual_port}/callback"
-        
-        # Generate authorization URL with updated redirect URI
-        auth_url = self.get_authorization_url()
-        print(f"Authorization URL: {auth_url}")
-        
-        # Open browser for user authorization
-        print("Opening browser for authorization...")
+
+    # ---------- Public Flow ----------
+
+    def authenticate(self, timeout_seconds: int = 300) -> Optional[dict]:
+        """
+        Launches browser → waits for code → exchanges for tokens.
+        Returns the token dict (with realm_id added) on success.
+        """
+        self._start_local_server()
+
+        auth_url = self._authorize_url()
+        print(f"\nIf the browser doesn't open, use this URL:\n{auth_url}\n")
         webbrowser.open(auth_url)
-        
-        # Wait for authorization code
-        print("Waiting for authorization...")
-        while not server.auth_code and not server.should_stop:
-            import time
-            time.sleep(1)
-        
-        if server.auth_code:
-            print("Authorization code received!")
-            return self._exchange_code_for_tokens(server.auth_code)
-        else:
-            print("No authorization code received")
+
+        print("Waiting for authorization in the browser…")
+        start = time.time()
+        while not self.server.should_stop and (time.time() - start) < timeout_seconds:
+            time.sleep(0.3)
+
+        code = getattr(self.server, "auth_code", None)
+        self.realm_id = getattr(self.server, "realm_id", None)
+        if not code:
+            print("No authorization code received (timed out or error).")
             return None
-    
-    def _exchange_code_for_tokens(self, auth_code: str) -> dict:
-        """Exchange authorization code for access and refresh tokens"""
-        print("Exchanging authorization code for tokens...")
-        
-        # This is a simplified version - in production, you'd want to handle this more robustly
-        # For now, we'll create a mock token structure
-        tokens = {
-            'access_token': f'mock_access_token_{auth_code[:8]}',
-            'refresh_token': f'mock_refresh_token_{auth_code[:8]}',
-            'realm_id': 'mock_realm_id',
-            'expires_in': 3600,
-            'token_type': 'bearer'
-        }
-        
-        print("Tokens received successfully!")
+
+        print("Authorization code received. Exchanging for tokens…")
+        tokens = self._exchange_code_for_tokens(code)
+        if tokens and self.realm_id and "realm_id" not in tokens:
+            tokens["realm_id"] = self.realm_id
+        if tokens:
+            self._save_tokens(tokens)
+            print(f"Tokens saved to: {self.token_file}")
         return tokens
-    
-    def save_tokens(self, tokens: dict):
-        """Save tokens to the token file"""
-        token_file = self.config.TOKEN_FILE
-        os.makedirs(os.path.dirname(token_file), exist_ok=True)
-        
-        with open(token_file, 'w') as f:
-            json.dump(tokens, f, indent=2)
-        
-        print(f"Tokens saved to: {token_file}")
-    
-    def test_connection(self) -> bool:
-        """Test the QuickBooks connection using saved tokens"""
+
+    def ensure_access_token(self) -> Optional[str]:
+        """
+        Loads tokens and refreshes them if needed.
+        Returns a valid access_token or None.
+        """
+        tokens = self._load_tokens()
+        if not tokens:
+            print("No tokens found. Run with --authenticate first.")
+            return None
+
+        # If you track expiry, you can refresh proactively. Here, we try a lightweight API call
+        # and refresh on 401. For now, just return the access token.
+        return tokens.get("access_token")
+
+    # ---------- Token Exchange & Refresh ----------
+
+    def _exchange_code_for_tokens(self, auth_code: str) -> Optional[dict]:
+        data = {
+            "grant_type": "authorization_code",
+            "code": auth_code,
+            "redirect_uri": self.config.REDIRECT_URI,
+        }
+        headers = self._token_headers()
         try:
-            from quickbooks_client import QuickBooksClient
-            client = QuickBooksClient()
-            
-            if not client.access_token or not client.realm_id:
-                print("No valid tokens found")
-                return False
-            
-            # Try to make a simple API call
-            print("Testing QuickBooks connection...")
-            projects = client.get_projects(max_results=1)
-            
-            if projects:
-                print("Connection successful! Found projects.")
-                return True
-            else:
-                print("Connection successful but no projects found.")
-                return True
-                
+            resp = requests.post(self.config.OAUTH_TOKEN_URL, data=data, headers=headers, timeout=30)
+            if resp.status_code != 200:
+                print(f"Token exchange failed ({resp.status_code}): {resp.text}")
+                return None
+            return resp.json()
         except Exception as e:
-            print(f"Connection test failed: {e}")
+            print(f"Token request error: {e}")
+            return None
+
+    def refresh_tokens(self) -> Optional[dict]:
+        tokens = self._load_tokens()
+        if not tokens or "refresh_token" not in tokens:
+            print("No refresh token available. Re-authenticate.")
+            return None
+
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": tokens["refresh_token"],
+        }
+        headers = self._token_headers()
+        try:
+            resp = requests.post(self.config.OAUTH_TOKEN_URL, data=data, headers=headers, timeout=30)
+            if resp.status_code != 200:
+                print(f"Refresh failed ({resp.status_code}): {resp.text}")
+                return None
+            new_tokens = resp.json()
+            # carry forward realm_id if not present
+            if "realm_id" not in new_tokens and "realm_id" in tokens:
+                new_tokens["realm_id"] = tokens["realm_id"]
+            self._save_tokens(new_tokens)
+            print("Tokens refreshed.")
+            return new_tokens
+        except Exception as e:
+            print(f"Refresh error: {e}")
+            return None
+
+    def _token_headers(self):
+        basic = base64.b64encode(
+            f"{self.config.CLIENT_ID}:{self.config.CLIENT_SECRET}".encode()
+        ).decode()
+        return {
+            "Authorization": f"Basic {basic}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        }
+
+    # ---------- Token Storage ----------
+
+    def _save_tokens(self, tokens: dict):
+        with open(self.token_file, "w") as f:
+            json.dump(tokens, f, indent=2)
+
+    def _load_tokens(self) -> Optional[dict]:
+        if not os.path.exists(self.token_file):
+            return None
+        with open(self.token_file, "r") as f:
+            try:
+                return json.load(f)
+            except Exception:
+                return None
+
+    # ---------- Simple API Smoke Test ----------
+
+    def test_company_info(self) -> bool:
+        """
+        Calls the CompanyInfo endpoint. If unauthorized, tries 1 refresh automatically.
+        """
+        tokens = self._load_tokens()
+        if not tokens or "access_token" not in tokens or "realm_id" not in tokens:
+            print("No valid tokens or realm_id. Authenticate first.")
             return False
 
+        ok = self._company_info(tokens["access_token"], tokens["realm_id"])
+        if ok is True:
+            print("CompanyInfo OK.")
+            return True
+        elif ok == 401:
+            # try refresh once
+            new_tokens = self.refresh_tokens()
+            if not new_tokens:
+                return False
+            ok2 = self._company_info(new_tokens["access_token"], new_tokens.get("realm_id", tokens.get("realm_id")))
+            if ok2 is True:
+                print("CompanyInfo OK after refresh.")
+                return True
+            else:
+                print(f"CompanyInfo failed after refresh (HTTP {ok2}).")
+                return False
+        else:
+            print(f"CompanyInfo failed (HTTP {ok}).")
+            return False
+
+    def _company_info(self, access_token: str, realm_id: str):
+        """
+        GET /v3/company/{realmId}/companyinfo/{realmId}
+        """
+        url = f"{self.config.API_BASE_URL}/v3/company/{realm_id}/companyinfo/{realm_id}"
+        params = {"minorversion": "65"}  # safe minor version as of 2024/2025
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        }
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=30)
+            if r.status_code == 200:
+                return True
+            return r.status_code
+        except requests.RequestException:
+            return 0  # network error
+
+    # ---------- Utils ----------
+
+    @staticmethod
+    def _random_state(n: int = 24) -> str:
+        # small local helper; state doesn't need to be cryptographically perfect here
+        import secrets
+        return secrets.token_urlsafe(n)
+
+
 def main():
-    """Main function for the authentication helper"""
     import argparse
-    
-    parser = argparse.ArgumentParser(description='QuickBooks Authentication Helper')
-    parser.add_argument('--test', action='store_true', help='Test existing connection')
-    parser.add_argument('--authenticate', action='store_true', help='Start OAuth authentication')
-    
+
+    parser = argparse.ArgumentParser(description="QuickBooks Authentication Helper")
+    parser.add_argument("--authenticate", action="store_true", help="Start OAuth authentication flow")
+    parser.add_argument("--test", action="store_true", help="Call CompanyInfo using saved/refresh tokens")
+    parser.add_argument("--refresh", action="store_true", help="Force a refresh token exchange")
     args = parser.parse_args()
-    
-    if not args.test and not args.authenticate:
-        parser.print_help()
-        return
-    
-    auth_helper = QuickBooksAuthHelper()
-    
-    if args.test:
-        if auth_helper.test_connection():
-            print("✓ Connection test passed")
-        else:
-            print("✗ Connection test failed")
-    
+
+    helper = QuickBooksAuthHelper()
+
     if args.authenticate:
-        tokens = auth_helper.authenticate()
+        tokens = helper.authenticate()
         if tokens:
-            auth_helper.save_tokens(tokens)
-            print("Authentication completed successfully!")
+            print("Authentication completed successfully.")
         else:
-            print("Authentication failed")
+            print("Authentication failed.")
+
+    if args.refresh:
+        ok = helper.refresh_tokens()
+        print("Refresh OK." if ok else "Refresh failed.")
+
+    if args.test:
+        ok = helper.test_company_info()
+        print("✓ Test passed" if ok else "✗ Test failed")
+
 
 if __name__ == "__main__":
-    main() 
+    main()
