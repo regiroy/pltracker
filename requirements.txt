@@ -1,0 +1,5 @@
+quickbooks-python
+pandas
+python-dotenv
+requests
+openpyxl

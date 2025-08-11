@@ -1,0 +1,13 @@
+# QuickBooks API Configuration
+# Copy this file to .env and fill in your actual values
+
+# QuickBooks OAuth Credentials
+# Get these from your QuickBooks Developer account
+QUICKBOOKS_CLIENT_ID=ABUDIuMGAVlMsGbWmYkfI8hmyJrM9EbFm1zRJBbLzPS7JWVV4U
+QUICKBOOKS_CLIENT_SECRET=3JKOtLc7NsziUPIdn7FMMxc5esmLzuYy9D6dKzLd
+
+# OAuth Redirect URI (usually localhost for development)
+QUICKBOOKS_REDIRECT_URI=http://localhost:8080/callback
+
+# Note: For production, use:
+# QUICKBOOKS_REDIRECT_URI=https://yourdomain.com/callback 
