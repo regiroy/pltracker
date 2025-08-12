@@ -307,6 +307,7 @@ class QuickBooksAuthHelper:
 
 
 def main():
+    print("Authentication Helper 2.")
     import argparse
 
     parser = argparse.ArgumentParser(description="QuickBooks Authentication Helper")
@@ -334,4 +335,5 @@ def main():
 
 
 if __name__ == "__main__":
+    print("Authentication Helper.")
     main()

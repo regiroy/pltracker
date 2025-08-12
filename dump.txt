@@ -1,3 +1,0 @@
-This sandbox-accounts.platform.intuit.com page can’t be found
-No webpage was found for the web address: https://sandbox-accounts.platform.intuit.com/connect/oauth2?client_id=your_client_id_here&response_type=code&scope=com.intuit.quickbooks.accounting%20com.intuit.quickbooks.payment%20com.intuit.quickbooks.payroll&redirect_uri=http://localhost:8080/callback&state=random_state_string
-HTTP ERROR 404
